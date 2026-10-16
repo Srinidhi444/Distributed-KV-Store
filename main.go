@@ -4,6 +4,9 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+
+	"github.com/Srinidhi444/Distributed-KV-Store/internal/api"
+	"github.com/Srinidhi444/Distributed-KV-Store/internal/store"
 )
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
@@ -16,9 +19,12 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	db := store.NewStore()
+	apiHandler := api.NewAPI(db)
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/health", healthHandler)
+	mux.HandleFunc("PUT /kv/{key}", apiHandler.SetHandler)
 
 	log.Println("Server running on port 8080")
 
