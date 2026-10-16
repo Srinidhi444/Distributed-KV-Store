@@ -2,26 +2,25 @@ package main
 
 import (
 	"fmt"
-
-	"github.com/Srinidhi444/Distributed-KV-Store/internal/store"
+	"log"
+	"net/http"
 )
 
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Only GET requests are allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	fmt.Fprintln(w, "OK")
+}
+
 func main() {
-	db := store.NewStore()
-	db.Set("name", "Srinidhi")
-	db.Set("language", "Go")
+	mux := http.NewServeMux()
 
-	value, exists := db.Get("name")
-	fmt.Println("NAME:", value, "Exists:", exists)
+	mux.HandleFunc("/health", healthHandler)
 
-	db.Set("language", "Rust")
+	log.Println("Server running on port 8080")
 
-	value, exists = db.Get("language")
-	fmt.Println("Language:", value, "Exists:", exists)
-
-	// 4. Delete a key
-	db.Delete("name")
-
-	value, exists = db.Get("name")
-	fmt.Println("After deletion:", value, "Exists:", exists)
+	log.Fatal(http.ListenAndServe(":8080", mux))
 }
