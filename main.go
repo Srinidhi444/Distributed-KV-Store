@@ -25,7 +25,7 @@ func main() {
 
 	mux.HandleFunc("/health", healthHandler)
 	mux.HandleFunc("PUT /kv/{key}", apiHandler.SetHandler)
-
+	mux.HandleFunc("GET /kv/{key}", apiHandler.GetHandler)
 	log.Println("Server running on port 8080")
 
 	log.Fatal(http.ListenAndServe(":8080", mux))
