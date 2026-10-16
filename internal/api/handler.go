@@ -66,3 +66,13 @@ func (a *API) GetHandler(w http.ResponseWriter, r *http.Request) {
 		log.Printf("failed to write GET response: %v", err)
 	}
 }
+
+func (a *API) DeleteHandler(w http.ResponseWriter, r *http.Request) {
+	key := r.PathValue("key")
+	if key == "" {
+		http.Error(w, "key cannot be empty", http.StatusBadRequest)
+		return
+	}
+	a.db.Delete(key)
+	w.WriteHeader(http.StatusNoContent)
+}
