@@ -2,7 +2,12 @@ package persistence
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"os"
+
+	"github.com/Srinidhi444/Distributed-KV-Store/internal/store"
 )
 
 type LogEntry struct {
@@ -46,4 +51,51 @@ func AppendEntry(path string, entry LogEntry) error {
 	}
 
 	return file.Sync()
+}
+
+func ReplayLog(path string, db *store.Store) error {
+	file, err := os.Open(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	defer file.Close()
+
+	decoder := json.NewDecoder(file)
+
+	for {
+		var entry LogEntry
+
+		err := decoder.Decode(&entry)
+
+		if errors.Is(err, io.EOF) {
+			break
+		}
+
+		if err != nil {
+			return err
+		}
+
+		if entry.Key == "" {
+			return fmt.Errorf("log entry contains empty key")
+		}
+
+		switch entry.Operation {
+		case "set":
+			db.Set(entry.Key, entry.Value)
+
+		case "delete":
+			db.Delete(entry.Key)
+
+		default:
+			return fmt.Errorf(
+				"unknown log operation: %s",
+				entry.Operation,
+			)
+		}
+	}
+
+	return nil
 }
