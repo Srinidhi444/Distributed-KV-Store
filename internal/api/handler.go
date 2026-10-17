@@ -5,11 +5,11 @@ import (
 	"log"
 	"net/http"
 
-	"github.com/Srinidhi444/Distributed-KV-Store/internal/store"
+	"github.com/Srinidhi444/Distributed-KV-Store/internal/persistence"
 )
 
 type API struct {
-	db *store.Store
+	db *persistence.PersistentStore
 }
 type SetRequest struct {
 	Value string `json:"value"`
@@ -19,7 +19,7 @@ type GetResponse struct {
 	Value string `json:"value"`
 }
 
-func NewAPI(db *store.Store) *API {
+func NewAPI(db *persistence.PersistentStore) *API {
 	return &API{db: db}
 }
 
@@ -39,7 +39,15 @@ func (a *API) SetHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	a.db.Set(key, req.Value)
+	if err := a.db.Set(key, req.Value); err != nil {
+		http.Error(
+			w,
+			"Failed to persist value",
+			http.StatusInternalServerError,
+		)
+		return
+	}
+
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -73,6 +81,13 @@ func (a *API) DeleteHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "key cannot be empty", http.StatusBadRequest)
 		return
 	}
-	a.db.Delete(key)
+	if err := a.db.Delete(key); err != nil {
+		http.Error(
+			w,
+			"Failed to persist value",
+			http.StatusInternalServerError,
+		)
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
 }

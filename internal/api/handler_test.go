@@ -4,17 +4,32 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/Srinidhi444/Distributed-KV-Store/internal/persistence"
 	"github.com/Srinidhi444/Distributed-KV-Store/internal/store"
 )
 
-func TestGetHandler(t *testing.T) {
-	db := store.NewStore()
-	db.Set("language", "Go")
+// Creates a fresh persistent database for each test.
+func setupTestAPI(t *testing.T) (*API, *store.Store) {
+	t.Helper()
 
-	apiHandler := NewAPI(db)
+	db := store.NewStore()
+
+	logPath := filepath.Join(t.TempDir(), "store.log")
+
+	persistentDB := persistence.NewPersistentStore(db, logPath)
+
+	return NewAPI(persistentDB), db
+}
+
+// Test 1: GET existing key
+func TestGetHandler(t *testing.T) {
+	apiHandler, db := setupTestAPI(t)
+
+	db.Set("language", "Go")
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /kv/{key}", apiHandler.GetHandler)
@@ -26,7 +41,6 @@ func TestGetHandler(t *testing.T) {
 	)
 
 	rec := httptest.NewRecorder()
-
 	mux.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
@@ -44,16 +58,19 @@ func TestGetHandler(t *testing.T) {
 	}
 }
 
-// Test 1: PUT valid JSON
+// Test 2: PUT valid JSON
 func TestSetHandler(t *testing.T) {
-	db := store.NewStore()
-	apiHandler := NewAPI(db)
+	apiHandler, db := setupTestAPI(t)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("PUT /kv/{key}", apiHandler.SetHandler)
 
 	body := strings.NewReader(`{"value":"Go"}`)
-	req := httptest.NewRequest(http.MethodPut, "/kv/language", body)
+	req := httptest.NewRequest(
+		http.MethodPut,
+		"/kv/language",
+		body,
+	)
 	req.Header.Set("Content-Type", "application/json")
 
 	rec := httptest.NewRecorder()
@@ -73,16 +90,19 @@ func TestSetHandler(t *testing.T) {
 	}
 }
 
-// Test 2: PUT invalid JSON
+// Test 3: PUT invalid JSON
 func TestSetInvalidJSON(t *testing.T) {
-	db := store.NewStore()
-	apiHandler := NewAPI(db)
+	apiHandler, db := setupTestAPI(t)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("PUT /kv/{key}", apiHandler.SetHandler)
 
 	body := strings.NewReader(`{"value":}`)
-	req := httptest.NewRequest(http.MethodPut, "/kv/language", body)
+	req := httptest.NewRequest(
+		http.MethodPut,
+		"/kv/language",
+		body,
+	)
 	req.Header.Set("Content-Type", "application/json")
 
 	rec := httptest.NewRecorder()
@@ -98,19 +118,22 @@ func TestSetInvalidJSON(t *testing.T) {
 	}
 }
 
-// Test 3: DELETE existing key
+// Test 4: DELETE existing key
 func TestDeleteHandler(t *testing.T) {
-	db := store.NewStore()
-	db.Set("language", "Go")
+	apiHandler, db := setupTestAPI(t)
 
-	apiHandler := NewAPI(db)
+	db.Set("language", "Go")
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("DELETE /kv/{key}", apiHandler.DeleteHandler)
 
-	req := httptest.NewRequest(http.MethodDelete, "/kv/language", nil)
-	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(
+		http.MethodDelete,
+		"/kv/language",
+		nil,
+	)
 
+	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusNoContent {
@@ -123,17 +146,20 @@ func TestDeleteHandler(t *testing.T) {
 	}
 }
 
-// Test 4: DELETE nonexistent key
+// Test 5: DELETE nonexistent key
 func TestDeleteNonExistentKey(t *testing.T) {
-	db := store.NewStore()
-	apiHandler := NewAPI(db)
+	apiHandler, db := setupTestAPI(t)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("DELETE /kv/{key}", apiHandler.DeleteHandler)
 
-	req := httptest.NewRequest(http.MethodDelete, "/kv/unknown", nil)
-	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(
+		http.MethodDelete,
+		"/kv/unknown",
+		nil,
+	)
 
+	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusNoContent {
@@ -143,5 +169,26 @@ func TestDeleteNonExistentKey(t *testing.T) {
 	_, exists := db.Get("unknown")
 	if exists {
 		t.Error("key should not exist")
+	}
+}
+
+// Test 6: GET nonexistent key
+func TestGetNonExistentKey(t *testing.T) {
+	apiHandler, _ := setupTestAPI(t)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /kv/{key}", apiHandler.GetHandler)
+
+	req := httptest.NewRequest(
+		http.MethodGet,
+		"/kv/unknown",
+		nil,
+	)
+
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("expected 404, got %d", rec.Code)
 	}
 }
