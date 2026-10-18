@@ -1,0 +1,3 @@
+{"op":"set","key":"language","value":"Go"}
+{"op":"set","key":"name","value":"Alex"}
+{"op":"delete","key":"language"}
