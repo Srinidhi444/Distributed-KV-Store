@@ -2,7 +2,9 @@ package persistence
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sync"
 )
@@ -19,6 +21,11 @@ const (
 	WALVersion = uint32(1)
 
 	MaxPayloadSize = 1024 * 1024
+)
+
+var (
+	ErrWALClosed = errors.New("WAL is closed")
+	ErrWALFailed = errors.New("WAL is in a failed state")
 )
 
 func EncodeWALHeader() []byte {
@@ -77,4 +84,59 @@ func OpenWAL(path string) (*WAL, error) {
 	return &WAL{
 		file: file,
 	}, nil
+}
+
+func (w *WAL) Append(entry LogEntry) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.closed {
+		return ErrWALClosed
+	}
+	if w.failed {
+		return ErrWALFailed
+	}
+
+	record, err := EncodeRecord(entry)
+	if err != nil {
+		return fmt.Errorf("encode wal record:%w", err)
+	}
+	if _, err := w.file.Seek(0, io.SeekEnd); err != nil {
+		w.failed = true
+		return fmt.Errorf("seek wal end:%w", err)
+	}
+	n, err := w.file.Write(record)
+	if n != len(record) {
+		w.failed = true
+		return fmt.Errorf(
+			"short WAL write: wrote %d of %d bytes",
+			n,
+			len(record),
+		)
+	}
+	// Request synchronization with persistent storage.
+	if err := w.file.Sync(); err != nil {
+		w.failed = true
+		return fmt.Errorf("sync WAL record: %w", err)
+	}
+
+	return nil
+}
+
+func (w *WAL) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.closed {
+		return nil
+	}
+
+	// Mark closed before releasing the underlying file.
+	w.closed = true
+
+	if err := w.file.Close(); err != nil {
+		return fmt.Errorf("close WAL: %w", err)
+	}
+
+	return nil
 }
