@@ -140,3 +140,27 @@ func (w *WAL) Close() error {
 
 	return nil
 }
+
+func ValidateWALHeader(r io.Reader) error {
+	header := make([]byte, 8)
+	if _, err := io.ReadFull(r, header); err != nil {
+		return fmt.Errorf("read WAL header:%w", err)
+	}
+	magic := string(header[0:4])
+	if magic != WALMagic {
+		return fmt.Errorf(
+			"invalid wal magic:expected %q,got %q",
+			WALMagic,
+			magic,
+		)
+	}
+	version := binary.BigEndian.Uint32(header[4:8])
+
+	if version != WALVersion {
+		return fmt.Errorf(
+			"unsupported Wal version: %d",
+			version,
+		)
+	}
+	return nil
+}
