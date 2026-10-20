@@ -286,3 +286,36 @@ func TestWALFileHeader(t *testing.T) {
 		t.Fatalf("unexpected WAL header: %x", data)
 	}
 }
+
+func TestWALExclusiveLock(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.wal")
+
+	// First instance acquires ownership.
+	wal1, err := OpenWAL(path)
+	if err != nil {
+		t.Fatalf("first OpenWAL failed: %v", err)
+	}
+
+	// Second instance must not acquire the same lock.
+	_, err = OpenWAL(path)
+	if err == nil {
+		t.Fatal("expected second OpenWAL to fail")
+	}
+
+	// Release ownership.
+	if err := wal1.Close(); err != nil {
+		t.Fatalf("close first WAL: %v", err)
+	}
+
+	// Retry after releasing the lock.
+	// Opening still fails because O_EXCL rejects existing files.
+	// Here we're testing that the error is no longer a lock conflict.
+	_, err = OpenWAL(path)
+	if err == nil {
+		t.Fatal("expected existing-file error")
+	}
+
+	if !strings.Contains(err.Error(), "file exists") {
+		t.Fatalf("expected existing-file error, got: %v", err)
+	}
+}

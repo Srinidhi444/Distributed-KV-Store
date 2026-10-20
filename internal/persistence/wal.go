@@ -7,6 +7,8 @@ import (
 	"io"
 	"os"
 	"sync"
+
+	"github.com/gofrs/flock"
 )
 
 type WAL struct {
@@ -14,6 +16,8 @@ type WAL struct {
 	mu     sync.Mutex
 	failed bool
 	closed bool
+
+	lock *flock.Flock
 }
 
 const (
@@ -39,6 +43,24 @@ func EncodeWALHeader() []byte {
 }
 
 func OpenWAL(path string) (*WAL, error) {
+	fileLock := flock.New(path + ".lock")
+
+	locked, err := fileLock.TryLock()
+	if err != nil {
+		return nil, fmt.Errorf("acquire WAL lock: %w", err)
+	}
+	if !locked {
+		return nil, fmt.Errorf("WAL is already in use: %s", path)
+	}
+
+	// Release the lock if initialization fails.
+	success := false
+	defer func() {
+		if !success {
+			_ = fileLock.Unlock()
+		}
+	}()
+
 	file, err := os.OpenFile(
 		path,
 		os.O_RDWR|os.O_CREATE|os.O_EXCL,
@@ -49,40 +71,35 @@ func OpenWAL(path string) (*WAL, error) {
 	}
 
 	// Close the file if initialization fails.
-	success := false
 	defer func() {
 		if !success {
-			file.Close()
+			_ = file.Close()
 		}
 	}()
 
-	// Encode the WAL header.
 	header := EncodeWALHeader()
 
-	// Write the header to disk.
 	n, err := file.Write(header)
 	if err != nil {
-		return nil, fmt.Errorf("failed to write WAL header: %w", err)
+		return nil, fmt.Errorf("write WAL header: %w", err)
 	}
-
-	// Ensure the complete header was written.
 	if n != len(header) {
 		return nil, fmt.Errorf(
-			"incomplete WAL header write: expected %d bytes, wrote %d",
-			len(header),
+			"short WAL header write: wrote %d of %d bytes",
 			n,
+			len(header),
 		)
 	}
 
-	// Synchronize the header to disk.
 	if err := file.Sync(); err != nil {
-		return nil, fmt.Errorf("failed to sync WAL header: %w", err)
+		return nil, fmt.Errorf("sync WAL header: %w", err)
 	}
 
 	success = true
 
 	return &WAL{
 		file: file,
+		lock: fileLock,
 	}, nil
 }
 
@@ -105,7 +122,14 @@ func (w *WAL) Append(entry LogEntry) error {
 		w.failed = true
 		return fmt.Errorf("seek wal end:%w", err)
 	}
+
 	n, err := w.file.Write(record)
+
+	if err != nil {
+		w.failed = true
+		return fmt.Errorf("write WAL record: %w", err)
+	}
+
 	if n != len(record) {
 		w.failed = true
 		return fmt.Errorf(
@@ -131,14 +155,16 @@ func (w *WAL) Close() error {
 		return nil
 	}
 
-	// Mark closed before releasing the underlying file.
 	w.closed = true
 
-	if err := w.file.Close(); err != nil {
-		return fmt.Errorf("close WAL: %w", err)
+	fileErr := w.file.Close()
+
+	var lockErr error
+	if w.lock != nil {
+		lockErr = w.lock.Unlock()
 	}
 
-	return nil
+	return errors.Join(fileErr, lockErr)
 }
 
 func ValidateWALHeader(r io.Reader) error {
