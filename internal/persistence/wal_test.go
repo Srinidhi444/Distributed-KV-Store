@@ -6,7 +6,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
@@ -106,32 +105,25 @@ func TestWALFileHeader(t *testing.T) {
 func TestWALExclusiveLock(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "store.wal")
 
-	// First instance acquires ownership.
 	wal1, err := OpenWAL(path)
 	if err != nil {
-		t.Fatalf("first OpenWAL failed: %v", err)
+		t.Fatalf("first OpenWAL: %v", err)
 	}
 
-	// Second instance must not acquire the same lock.
+	// A second instance cannot open the same WAL.
 	_, err = OpenWAL(path)
-	if err == nil {
-		t.Fatal("expected second OpenWAL to fail")
+	if !errors.Is(err, ErrWALLocked) {
+		t.Fatalf("expected ErrWALLocked, got %v", err)
 	}
 
-	// Release ownership.
 	if err := wal1.Close(); err != nil {
 		t.Fatalf("close first WAL: %v", err)
 	}
 
-	// Retry after releasing the lock.
-	// Opening still fails because O_EXCL rejects existing files.
-	// Here we're testing that the error is no longer a lock conflict.
-	_, err = OpenWAL(path)
-	if err == nil {
-		t.Fatal("expected existing-file error")
+	// After releasing ownership, reopening should succeed.
+	wal2, err := OpenWAL(path)
+	if err != nil {
+		t.Fatalf("reopen WAL after unlock: %v", err)
 	}
-
-	if !strings.Contains(err.Error(), "file exists") {
-		t.Fatalf("expected existing-file error, got: %v", err)
-	}
+	defer wal2.Close()
 }

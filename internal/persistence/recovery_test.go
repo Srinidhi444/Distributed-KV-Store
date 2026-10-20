@@ -265,4 +265,64 @@ func TestWALReplayInvalidMagic(t *testing.T) {
 	}
 }
 
-// Ensure imported packages are used by checking the WAL's raw header.
+func TestWALReopenAndReplay(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.wal")
+
+	// First database session.
+	wal1, err := OpenWAL(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	entries := []LogEntry{
+		NewSetEntry("language", "Go"),
+		NewSetEntry("name", "Alex"),
+		NewDeleteEntry("language"),
+	}
+
+	for _, entry := range entries {
+		if err := wal1.Append(entry); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := wal1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate restarting the database.
+	wal2, err := OpenWAL(path)
+	if err != nil {
+		t.Fatalf("reopen WAL: %v", err)
+	}
+	defer wal2.Close()
+
+	var recovered []LogEntry
+
+	err = wal2.Replay(func(entry LogEntry) error {
+		recovered = append(recovered, entry)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("replay reopened WAL: %v", err)
+	}
+
+	if len(recovered) != len(entries) {
+		t.Fatalf(
+			"expected %d recovered records, got %d",
+			len(entries),
+			len(recovered),
+		)
+	}
+
+	for i := range entries {
+		if recovered[i] != entries[i] {
+			t.Fatalf(
+				"record %d: expected %+v, got %+v",
+				i,
+				entries[i],
+				recovered[i],
+			)
+		}
+	}
+}

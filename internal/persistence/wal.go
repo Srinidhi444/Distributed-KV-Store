@@ -30,6 +30,7 @@ const (
 var (
 	ErrWALClosed = errors.New("WAL is closed")
 	ErrWALFailed = errors.New("WAL is in a failed state")
+	ErrWALLocked = errors.New("WAL IS LOCKED")
 )
 
 func EncodeWALHeader() []byte {
@@ -49,50 +50,72 @@ func OpenWAL(path string) (*WAL, error) {
 	if err != nil {
 		return nil, fmt.Errorf("acquire WAL lock: %w", err)
 	}
+
 	if !locked {
-		return nil, fmt.Errorf("WAL is already in use: %s", path)
+		return nil, fmt.Errorf("%w: %s", ErrWALLocked, path)
 	}
 
-	// Release the lock if initialization fails.
 	success := false
+
 	defer func() {
 		if !success {
 			_ = fileLock.Unlock()
 		}
 	}()
 
+	// Try to create a brand-new WAL file.
 	file, err := os.OpenFile(
 		path,
 		os.O_RDWR|os.O_CREATE|os.O_EXCL,
 		0600,
 	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create WAL: %w", err)
+
+	newFile := err == nil
+
+	if errors.Is(err, os.ErrExist) {
+		// Existing WAL: open without truncating it.
+		file, err = os.OpenFile(path, os.O_RDWR, 0600)
 	}
 
-	// Close the file if initialization fails.
+	if err != nil {
+		return nil, fmt.Errorf("open WAL: %w", err)
+	}
+
 	defer func() {
 		if !success {
 			_ = file.Close()
 		}
 	}()
 
-	header := EncodeWALHeader()
+	if newFile {
+		header := EncodeWALHeader()
 
-	n, err := file.Write(header)
-	if err != nil {
-		return nil, fmt.Errorf("write WAL header: %w", err)
-	}
-	if n != len(header) {
-		return nil, fmt.Errorf(
-			"short WAL header write: wrote %d of %d bytes",
-			n,
-			len(header),
-		)
+		n, err := file.Write(header)
+		if err != nil {
+			return nil, fmt.Errorf("write WAL header: %w", err)
+		}
+
+		if n != len(header) {
+			return nil, fmt.Errorf(
+				"short WAL header write: wrote %d of %d bytes",
+				n,
+				len(header),
+			)
+		}
+
+		if err := file.Sync(); err != nil {
+			return nil, fmt.Errorf("sync WAL header: %w", err)
+		}
+	} else {
+		// Existing WAL must be fully valid before new appends.
+		if err := validateExistingWAL(file); err != nil {
+			return nil, fmt.Errorf("open existing WAL: %w", err)
+		}
 	}
 
-	if err := file.Sync(); err != nil {
-		return nil, fmt.Errorf("sync WAL header: %w", err)
+	// Position the cursor for future appends.
+	if _, err := file.Seek(0, io.SeekEnd); err != nil {
+		return nil, fmt.Errorf("seek WAL end: %w", err)
 	}
 
 	success = true
@@ -189,4 +212,51 @@ func ValidateWALHeader(r io.Reader) error {
 		)
 	}
 	return nil
+}
+
+func validateExistingWAL(file *os.File) error {
+	// Step 1: Move to the beginning of the WAL.
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("seek WAL start: %w", err)
+	}
+
+	// Step 2: Validate the existing 8-byte WAL header.
+	if err := ValidateWALHeader(file); err != nil {
+		return fmt.Errorf("validate WAL header: %w", err)
+	}
+
+	// Step 3: Validate every record.
+	for {
+		startOffset, err := file.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return fmt.Errorf("get WAL offset: %w", err)
+		}
+
+		// DecodeRecord also verifies CRC32C and record validity.
+		_, err = DecodeRecord(file)
+
+		if err == nil {
+			continue
+		}
+
+		// Step 4: Distinguish clean EOF from truncated data.
+		if errors.Is(err, io.EOF) {
+			endOffset, seekErr := file.Seek(0, io.SeekCurrent)
+			if seekErr != nil {
+				return fmt.Errorf("get WAL end offset: %w", seekErr)
+			}
+
+			// EOF without consuming bytes means normal end of file.
+			if startOffset == endOffset {
+				return nil
+			}
+		}
+
+		// Any other error means the WAL is invalid.
+		return fmt.Errorf(
+			"invalid WAL record at offset %d: %w",
+			startOffset,
+			err,
+		)
+	}
 }
