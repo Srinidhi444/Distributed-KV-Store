@@ -253,10 +253,22 @@ func validateExistingWAL(file *os.File) error {
 		}
 
 		// Any other error means the WAL is invalid.
-		return fmt.Errorf(
-			"invalid WAL record at offset %d: %w",
-			startOffset,
-			err,
-		)
+		if isIncompleteRecordError(err) {
+			return &WALRecoveryError{
+				Offset:         startOffset,
+				LastGoodOffset: startOffset,
+				Cause: fmt.Errorf(
+					"%w: %w",
+					ErrIncompleteWALRecord,
+					err,
+				),
+			}
+		}
+
+		return &WALRecoveryError{
+			Offset:         startOffset,
+			LastGoodOffset: startOffset,
+			Cause:          err,
+		}
 	}
 }
