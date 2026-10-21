@@ -8,15 +8,15 @@ import (
 )
 
 type PersistentStore struct {
-	db      *store.Store
-	logPath string
-	mu      sync.Mutex
+	db  *store.Store
+	wal *WAL
+	mu  sync.Mutex
 }
 
-func NewPersistentStore(db *store.Store, logPath string) *PersistentStore {
+func NewPersistentStore(db *store.Store, wal *WAL) *PersistentStore {
 	return &PersistentStore{
-		db:      db,
-		logPath: logPath,
+		db:  db,
+		wal: wal,
 	}
 }
 
@@ -30,7 +30,7 @@ func (p *PersistentStore) Set(key string, value string) error {
 
 	entry := NewSetEntry(key, value)
 
-	if err := AppendEntry(p.logPath, entry); err != nil {
+	if err := p.wal.Append(entry); err != nil {
 		return fmt.Errorf("failed to append SET operation: %w", err)
 	}
 
@@ -53,7 +53,7 @@ func (p *PersistentStore) Delete(key string) error {
 
 	entry := NewDeleteEntry(key)
 
-	if err := AppendEntry(p.logPath, entry); err != nil {
+	if err := p.wal.Append(entry); err != nil {
 		return fmt.Errorf("failed to append DELETE operation: %w", err)
 	}
 
