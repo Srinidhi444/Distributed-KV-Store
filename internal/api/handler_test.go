@@ -12,15 +12,25 @@ import (
 	"github.com/Srinidhi444/Distributed-KV-Store/internal/store"
 )
 
-// Creates a fresh persistent database for each test.
 func setupTestAPI(t *testing.T) (*API, *store.Store) {
 	t.Helper()
 
 	db := store.NewStore()
 
-	logPath := filepath.Join(t.TempDir(), "store.log")
+	walPath := filepath.Join(t.TempDir(), "store.wal")
 
-	persistentDB := persistence.NewPersistentStore(db, logPath)
+	wal, err := persistence.OpenWAL(walPath)
+	if err != nil {
+		t.Fatalf("failed to open test WAL: %v", err)
+	}
+
+	persistentDB := persistence.NewPersistentStore(db, wal)
+
+	t.Cleanup(func() {
+		if err := persistentDB.Close(); err != nil {
+			t.Errorf("failed to close test database: %v", err)
+		}
+	})
 
 	return NewAPI(persistentDB), db
 }

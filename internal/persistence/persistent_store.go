@@ -61,3 +61,9 @@ func (p *PersistentStore) Delete(key string) error {
 
 	return nil
 }
+
+func (p *PersistentStore) Close() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.wal.Close()
+}
