@@ -48,7 +48,7 @@ func OpenPersistentStore(walPath string) (*PersistentStore, error) {
 	}
 
 	// Step 5: Construct the persistent database.
-	persistentDB := NewPersistentStore(db, wal)
+	persistentDB := newPersistentStore(db, wal)
 
 	success = true
 

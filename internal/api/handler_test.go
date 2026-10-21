@@ -9,30 +9,26 @@ import (
 	"testing"
 
 	"github.com/Srinidhi444/Distributed-KV-Store/internal/persistence"
-	"github.com/Srinidhi444/Distributed-KV-Store/internal/store"
 )
 
-func setupTestAPI(t *testing.T) (*API, *store.Store) {
+// Creates a fresh persistent database for each test.
+func setupTestAPI(t *testing.T) (*API, *persistence.PersistentStore) {
 	t.Helper()
-
-	db := store.NewStore()
 
 	walPath := filepath.Join(t.TempDir(), "store.wal")
 
-	wal, err := persistence.OpenWAL(walPath)
+	db, err := persistence.OpenPersistentStore(walPath)
 	if err != nil {
-		t.Fatalf("failed to open test WAL: %v", err)
+		t.Fatalf("open test database: %v", err)
 	}
 
-	persistentDB := persistence.NewPersistentStore(db, wal)
-
 	t.Cleanup(func() {
-		if err := persistentDB.Close(); err != nil {
-			t.Errorf("failed to close test database: %v", err)
+		if err := db.Close(); err != nil {
+			t.Errorf("close test database: %v", err)
 		}
 	})
 
-	return NewAPI(persistentDB), db
+	return NewAPI(db), db
 }
 
 // Test 1: GET existing key

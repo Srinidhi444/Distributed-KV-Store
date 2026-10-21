@@ -34,7 +34,7 @@ func TestPersistenceRecovery(t *testing.T) {
 	}
 
 	db1 := store.NewStore()
-	persistentDB := NewPersistentStore(db1, wal1)
+	persistentDB := newPersistentStore(db1, wal1)
 
 	if err := persistentDB.Set("language", "Go"); err != nil {
 		t.Fatal(err)
@@ -82,7 +82,7 @@ func TestDeleteRecovery(t *testing.T) {
 	}
 
 	db1 := store.NewStore()
-	persistentDB := NewPersistentStore(db1, wal1)
+	persistentDB := newPersistentStore(db1, wal1)
 
 	if err := persistentDB.Set("language", "Go"); err != nil {
 		t.Fatal(err)
@@ -123,7 +123,7 @@ func TestUpdateRecovery(t *testing.T) {
 	}
 
 	db1 := store.NewStore()
-	persistentDB := NewPersistentStore(db1, wal1)
+	persistentDB := newPersistentStore(db1, wal1)
 
 	if err := persistentDB.Set("language", "Go"); err != nil {
 		t.Fatal(err)
@@ -237,7 +237,7 @@ func TestAppendFailure(t *testing.T) {
 	}
 
 	db := store.NewStore()
-	persistentDB := NewPersistentStore(db, wal)
+	persistentDB := newPersistentStore(db, wal)
 
 	// Closing the WAL forces subsequent appends to fail.
 	if err := wal.Close(); err != nil {

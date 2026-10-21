@@ -26,45 +26,36 @@ func main() {
 	}
 }
 
-func run() error {
-	// Step 1: Ensure the data directory exists.
+func run() (retErr error) {
 	if err := os.MkdirAll("data", 0700); err != nil {
 		return fmt.Errorf("create data directory: %w", err)
 	}
 
-	// Step 2: Open the WAL and recover existing database state.
-	walPath := "data/store.wal"
-
-	persistentDB, err := persistence.OpenPersistentStore(walPath)
+	persistentDB, err := persistence.OpenPersistentStore("data/store.wal")
 	if err != nil {
 		return fmt.Errorf("open persistent database: %w", err)
 	}
 
-	// Ensure the WAL is eventually closed.
 	defer func() {
-		if err := persistentDB.Close(); err != nil {
-			log.Printf("failed to close persistent database: %v", err)
-		}
+		retErr = errors.Join(retErr, persistentDB.Close())
 	}()
 
-	// Step 3: Initialize HTTP handlers.
 	apiHandler := api.NewAPI(persistentDB)
 
 	mux := http.NewServeMux()
-
 	mux.HandleFunc("GET /health", healthHandler)
 	mux.HandleFunc("PUT /kv/{key}", apiHandler.SetHandler)
 	mux.HandleFunc("GET /kv/{key}", apiHandler.GetHandler)
 	mux.HandleFunc("DELETE /kv/{key}", apiHandler.DeleteHandler)
 
-	// Step 4: Configure the HTTP server.
+	gate := api.NewRequestGate()
+
 	server := &http.Server{
 		Addr:              ":8080",
-		Handler:           mux,
+		Handler:           gate.Wrap(mux),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
-	// Step 5: Listen for operating system shutdown signals.
 	ctx, stop := signal.NotifyContext(
 		context.Background(),
 		os.Interrupt,
@@ -72,7 +63,6 @@ func run() error {
 	)
 	defer stop()
 
-	// Step 6: Start the HTTP server in a goroutine.
 	serverErr := make(chan error, 1)
 
 	go func() {
@@ -81,9 +71,10 @@ func run() error {
 
 	log.Println("Server running on port 8080")
 
-	// Step 7: Wait for shutdown or an unexpected server failure.
 	select {
 	case err := <-serverErr:
+		gate.StopAndWait()
+
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			return fmt.Errorf("HTTP server failed: %w", err)
 		}
@@ -93,30 +84,35 @@ func run() error {
 		log.Println("Shutdown signal received")
 	}
 
-	// Stop receiving further shutdown signals.
 	stop()
 
-	// Step 8: Give active requests time to finish.
 	shutdownCtx, cancel := context.WithTimeout(
 		context.Background(),
 		10*time.Second,
 	)
 	defer cancel()
 
-	if err := server.Shutdown(shutdownCtx); err != nil {
-		// Force the HTTP server to close its connections.
-		// In-flight handlers may still be running.
-		_ = server.Close()
+	shutdownErr := server.Shutdown(shutdownCtx)
 
-		// Do not close the database while handlers may
-		// still be accessing its WAL.
-		return fmt.Errorf("HTTP shutdown failed: %w", err)
+	if shutdownErr != nil {
+		log.Printf("graceful shutdown failed: %v", shutdownErr)
+
+		// Stop connections, then wait for handlers that
+		// may still be running.
+		shutdownErr = errors.Join(shutdownErr, server.Close())
 	}
 
-	// Step 9: Wait for the serving goroutine to exit.
-	if err := <-serverErr; err != nil &&
-		!errors.Is(err, http.ErrServerClosed) {
-		return fmt.Errorf("HTTP server stopped: %w", err)
+	// Prevent any newly entering handler from using storage,
+	// and wait for handlers already admitted to finish.
+	gate.StopAndWait()
+
+	err = <-serverErr
+	if err != nil && !errors.Is(err, http.ErrServerClosed) {
+		shutdownErr = errors.Join(shutdownErr, err)
+	}
+
+	if shutdownErr != nil {
+		return fmt.Errorf("HTTP shutdown: %w", shutdownErr)
 	}
 
 	log.Println("HTTP server shut down successfully")

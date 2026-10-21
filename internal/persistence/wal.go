@@ -17,7 +17,9 @@ type WAL struct {
 	failed bool
 	closed bool
 
-	lock *flock.Flock
+	lock        *flock.Flock
+	writeRecord func([]byte) (int, error)
+	syncRecord  func() error
 }
 
 const (
@@ -121,8 +123,10 @@ func OpenWAL(path string) (*WAL, error) {
 	success = true
 
 	return &WAL{
-		file: file,
-		lock: fileLock,
+		file:        file,
+		lock:        fileLock,
+		writeRecord: file.Write,
+		syncRecord:  file.Sync,
 	}, nil
 }
 
@@ -133,21 +137,22 @@ func (w *WAL) Append(entry LogEntry) error {
 	if w.closed {
 		return ErrWALClosed
 	}
+
 	if w.failed {
 		return ErrWALFailed
 	}
 
 	record, err := EncodeRecord(entry)
 	if err != nil {
-		return fmt.Errorf("encode wal record:%w", err)
+		return fmt.Errorf("encode WAL record: %w", err)
 	}
+
 	if _, err := w.file.Seek(0, io.SeekEnd); err != nil {
 		w.failed = true
-		return fmt.Errorf("seek wal end:%w", err)
+		return fmt.Errorf("seek WAL end: %w", err)
 	}
 
-	n, err := w.file.Write(record)
-
+	n, err := w.writeRecord(record)
 	if err != nil {
 		w.failed = true
 		return fmt.Errorf("write WAL record: %w", err)
@@ -161,8 +166,8 @@ func (w *WAL) Append(entry LogEntry) error {
 			len(record),
 		)
 	}
-	// Request synchronization with persistent storage.
-	if err := w.file.Sync(); err != nil {
+
+	if err := w.syncRecord(); err != nil {
 		w.failed = true
 		return fmt.Errorf("sync WAL record: %w", err)
 	}

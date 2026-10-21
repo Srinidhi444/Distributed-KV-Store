@@ -13,7 +13,7 @@ type PersistentStore struct {
 	mu  sync.Mutex
 }
 
-func NewPersistentStore(db *store.Store, wal *WAL) *PersistentStore {
+func newPersistentStore(db *store.Store, wal *WAL) *PersistentStore {
 	return &PersistentStore{
 		db:  db,
 		wal: wal,
