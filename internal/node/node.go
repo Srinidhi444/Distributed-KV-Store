@@ -13,6 +13,7 @@ import (
 	"github.com/Srinidhi444/Distributed-KV-Store/internal/api"
 	"github.com/Srinidhi444/Distributed-KV-Store/internal/config"
 	"github.com/Srinidhi444/Distributed-KV-Store/internal/persistence"
+	"github.com/Srinidhi444/Distributed-KV-Store/internal/transport"
 )
 
 var (
@@ -58,6 +59,10 @@ func New(cfg config.Config) (*Node, error) {
 	mux.HandleFunc("PUT /kv/{key}", apiHandler.SetHandler)
 	mux.HandleFunc("GET /kv/{key}", apiHandler.GetHandler)
 	mux.HandleFunc("DELETE /kv/{key}", apiHandler.DeleteHandler)
+	mux.Handle(
+		"POST /internal/ping",
+		transport.NewPingHandler(cfg.NodeID),
+	)
 
 	gate := api.NewRequestGate()
 
