@@ -55,7 +55,6 @@ func New(cfg config.Config) (*Node, error) {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /health", handleHealth)
-	mux.HandleFunc("GET /health", handleHealth)
 	mux.HandleFunc("PUT /kv/{key}", apiHandler.SetHandler)
 	mux.HandleFunc("GET /kv/{key}", apiHandler.GetHandler)
 	mux.HandleFunc("DELETE /kv/{key}", apiHandler.DeleteHandler)
