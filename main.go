@@ -5,56 +5,43 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
-	"github.com/Srinidhi444/Distributed-KV-Store/internal/api"
-	"github.com/Srinidhi444/Distributed-KV-Store/internal/persistence"
+	"github.com/Srinidhi444/Distributed-KV-Store/internal/config"
+	"github.com/Srinidhi444/Distributed-KV-Store/internal/node"
 )
-
-func healthHandler(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintln(w, "OK")
-}
 
 func main() {
 	if err := run(); err != nil {
-		log.Printf("server stopped with error: %v", err)
+		log.Printf("application error: %v", err)
 		os.Exit(1)
 	}
 }
 
-func run() (retErr error) {
-	if err := os.MkdirAll("data", 0700); err != nil {
-		return fmt.Errorf("create data directory: %w", err)
-	}
-
-	persistentDB, err := persistence.OpenPersistentStore("data/store.wal")
+func run() error {
+	cfg, err := config.ParseFlags(os.Args[1:])
 	if err != nil {
-		return fmt.Errorf("open persistent database: %w", err)
+		return fmt.Errorf("parse node configuration: %w", err)
 	}
 
-	defer func() {
-		retErr = errors.Join(retErr, persistentDB.Close())
-	}()
-
-	apiHandler := api.NewAPI(persistentDB)
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /health", healthHandler)
-	mux.HandleFunc("PUT /kv/{key}", apiHandler.SetHandler)
-	mux.HandleFunc("GET /kv/{key}", apiHandler.GetHandler)
-	mux.HandleFunc("DELETE /kv/{key}", apiHandler.DeleteHandler)
-
-	gate := api.NewRequestGate()
-
-	server := &http.Server{
-		Addr:              ":8080",
-		Handler:           gate.Wrap(mux),
-		ReadHeaderTimeout: 5 * time.Second,
+	n, err := node.New(cfg)
+	if err != nil {
+		return fmt.Errorf("initialize node %s: %w", cfg.NodeID, err)
 	}
+
+	if err := n.Start(); err != nil {
+		return fmt.Errorf("start node %s: %w", cfg.NodeID, err)
+	}
+
+	log.Printf(
+		"node %s listening on %s, data directory: %s",
+		cfg.NodeID,
+		cfg.Address,
+		cfg.DataDir,
+	)
 
 	ctx, stop := signal.NotifyContext(
 		context.Background(),
@@ -63,28 +50,9 @@ func run() (retErr error) {
 	)
 	defer stop()
 
-	serverErr := make(chan error, 1)
+	<-ctx.Done()
 
-	go func() {
-		serverErr <- server.ListenAndServe()
-	}()
-
-	log.Println("Server running on port 8080")
-
-	select {
-	case err := <-serverErr:
-		gate.StopAndWait()
-
-		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			return fmt.Errorf("HTTP server failed: %w", err)
-		}
-		return nil
-
-	case <-ctx.Done():
-		log.Println("Shutdown signal received")
-	}
-
-	stop()
+	log.Printf("shutting down node %s", cfg.NodeID)
 
 	shutdownCtx, cancel := context.WithTimeout(
 		context.Background(),
@@ -92,29 +60,13 @@ func run() (retErr error) {
 	)
 	defer cancel()
 
-	shutdownErr := server.Shutdown(shutdownCtx)
-
-	if shutdownErr != nil {
-		log.Printf("graceful shutdown failed: %v", shutdownErr)
-
-		// Stop connections, then wait for handlers that
-		// may still be running.
-		shutdownErr = errors.Join(shutdownErr, server.Close())
+	if err := n.Shutdown(shutdownCtx); err != nil {
+		return errors.Join(
+			fmt.Errorf("shutdown node %s: %w", cfg.NodeID, err),
+		)
 	}
 
-	// Prevent any newly entering handler from using storage,
-	// and wait for handlers already admitted to finish.
-	gate.StopAndWait()
+	log.Printf("node %s stopped successfully", cfg.NodeID)
 
-	err = <-serverErr
-	if err != nil && !errors.Is(err, http.ErrServerClosed) {
-		shutdownErr = errors.Join(shutdownErr, err)
-	}
-
-	if shutdownErr != nil {
-		return fmt.Errorf("HTTP shutdown: %w", shutdownErr)
-	}
-
-	log.Println("HTTP server shut down successfully")
 	return nil
 }
