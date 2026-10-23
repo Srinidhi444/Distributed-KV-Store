@@ -84,7 +84,8 @@ func (pm *PeerManager) PingPeer(
 	// Verify that the response came from the expected node ID.
 	if resp.NodeID != peerID {
 		return PingResponse{}, fmt.Errorf(
-			"peer identity mismatch: expected %q, got %q",
+			"%w: expected %q, got %q",
+			ErrPeerIdentityMismatch,
 			peerID,
 			resp.NodeID,
 		)
