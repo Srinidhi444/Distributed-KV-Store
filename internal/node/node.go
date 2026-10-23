@@ -22,8 +22,9 @@ var (
 )
 
 type Node struct {
-	cfg config.Config
-	db  *persistence.PersistentStore
+	cfg   config.Config
+	db    *persistence.PersistentStore
+	peers *transport.PeerManager
 
 	server   *http.Server
 	listener net.Listener
@@ -53,6 +54,11 @@ func New(cfg config.Config) (*Node, error) {
 		return nil, fmt.Errorf("open persistent store: %w", err)
 	}
 	apiHandler := api.NewAPI(db)
+	peerManager := transport.NewPeerManager(
+		cfg.NodeID,
+		cfg.Peers,
+		transport.NewClient(),
+	)
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /health", handleHealth)
@@ -75,10 +81,18 @@ func New(cfg config.Config) (*Node, error) {
 	return &Node{
 		cfg:      cfg,
 		db:       db,
+		peers:    peerManager,
 		server:   server,
 		gate:     gate,
 		serveErr: make(chan error, 1),
 	}, nil
+}
+
+func (n *Node) PingPeer(
+	ctx context.Context,
+	peerID string,
+) (transport.PingResponse, error) {
+	return n.peers.PingPeer(ctx, peerID)
 }
 
 func (n *Node) Start() error {
