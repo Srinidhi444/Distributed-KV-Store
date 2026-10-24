@@ -17,13 +17,13 @@ const (
 )
 
 type Command struct {
-	Type  CommandType
-	Key   string
-	Value string
+	Type  CommandType `json:"type"`
+	Key   string      `json:"key,omitempty"`
+	Value string      `json:"value,omitempty"`
 }
 
 type LogEntry struct {
-	Index   uint64
-	Term    uint64
-	Command Command
+	Index   uint64  `json:"index"`
+	Term    uint64  `json:"term"`
+	Command Command `json:"command"`
 }
