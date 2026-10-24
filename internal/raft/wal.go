@@ -274,3 +274,19 @@ func validateRaftWALRecords(file *os.File) error {
 		)
 	}
 }
+
+// checkState safely reports whether the WAL can be used.
+func (w *RaftWAL) checkState() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.closed {
+		return ErrStorageClosed
+	}
+
+	if w.failed {
+		return ErrStorageFailed
+	}
+
+	return nil
+}
