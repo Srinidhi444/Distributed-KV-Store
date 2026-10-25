@@ -24,6 +24,9 @@ type Event struct {
 
 	From      string
 	RequestID uint64
+	// Local correlation data for AppendEntries responses.
+	SentPrevLogIndex uint64
+	SentLastIndex    uint64
 
 	RequestVote         *RequestVoteRequest
 	RequestVoteResponse *RequestVoteResponse

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Srinidhi444/Distributed-KV-Store/internal/config"
+	"github.com/Srinidhi444/Distributed-KV-Store/internal/raft"
 )
 
 func testConfig(t *testing.T) config.Config {
@@ -132,8 +133,8 @@ func TestNewNode(t *testing.T) {
 	}
 	defer n.Shutdown(context.Background())
 
-	if n.db == nil {
-		t.Fatal("expected initialized persistent store")
+	if n.raftNode == nil || n.runtime == nil || n.raftStorage == nil {
+		t.Fatal("expected initialized Raft runtime and WAL")
 	}
 
 	if n.server == nil {
@@ -190,8 +191,13 @@ func TestNewNodeRejectsCorruptedWAL(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := n.db.Set("key", "value"); err != nil {
+	if err := n.Start(); err != nil {
 		t.Fatal(err)
+	}
+	waitLeaderForTest(t, n)
+	status, _ := httpRequest(t, http.MethodPut, nodeURL(n, "/kv/key"), `{"value":"value"}`)
+	if status != http.StatusOK {
+		t.Fatalf("PUT: %d", status)
 	}
 
 	if err := n.Shutdown(context.Background()); err != nil {
@@ -199,7 +205,7 @@ func TestNewNodeRejectsCorruptedWAL(t *testing.T) {
 	}
 
 	// Replace the WAL header with invalid bytes.
-	if err := os.WriteFile(cfg.WALPath(), []byte("INVALID!"), 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(cfg.DataDir, "raft.wal"), []byte("INVALID!"), 0600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -239,7 +245,7 @@ func TestNodeCRUD(t *testing.T) {
 	if err := n.Start(); err != nil {
 		t.Fatal(err)
 	}
-
+	waitLeaderForTest(t, n)
 	baseURL := nodeURL(n, "/kv/language")
 
 	status, _ := httpRequest(
@@ -389,7 +395,7 @@ func TestNodeRecoveryAfterRestart(t *testing.T) {
 	if err := first.Start(); err != nil {
 		t.Fatal(err)
 	}
-
+	waitLeaderForTest(t, first)
 	status, _ := httpRequest(
 		t,
 		http.MethodPut,
@@ -413,7 +419,7 @@ func TestNodeRecoveryAfterRestart(t *testing.T) {
 	if err := second.Start(); err != nil {
 		t.Fatal(err)
 	}
-
+	waitLeaderForTest(t, second)
 	status, body := httpRequest(
 		t,
 		http.MethodGet,
@@ -441,6 +447,9 @@ func TestIndependentNodes(t *testing.T) {
 		}
 	}
 
+	for _, n := range []*Node{node1, node2, node3} {
+		waitLeaderForTest(t, n)
+	}
 	for i, n := range []*Node{node1, node2, node3} {
 		value := fmt.Sprintf("value-%d", i+1)
 
@@ -502,4 +511,17 @@ func TestNodeShutdownReleasesWALLock(t *testing.T) {
 		t.Fatalf("expected WAL lock to be released: %v", err)
 	}
 	defer second.Shutdown(context.Background())
+}
+
+// waitLeaderForTest waits for a singleton test node to elect itself.
+func waitLeaderForTest(t *testing.T, n *Node) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if n.raftNode.Role() == raft.Leader {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("%s failed to become leader", n.cfg.NodeID)
 }

@@ -54,6 +54,9 @@ func validateEvent(event Event) error {
 		}
 
 	case EventRequestVote:
+		if event.RequestVote != nil && event.RequestVote.Term == 0 {
+			return fmt.Errorf("%w: zero RequestVote term", ErrInvalidEvent)
+		}
 		if event.RequestVote == nil {
 			return fmt.Errorf(
 				"%w: missing RequestVote payload",
@@ -112,6 +115,9 @@ func validateEvent(event Event) error {
 		}
 
 	case EventAppendEntries:
+		if event.AppendEntries != nil && event.AppendEntries.Term == 0 {
+			return fmt.Errorf("%w: zero AppendEntries term", ErrInvalidEvent)
+		}
 		if event.AppendEntries == nil {
 			return fmt.Errorf(
 				"%w: missing AppendEntries payload",

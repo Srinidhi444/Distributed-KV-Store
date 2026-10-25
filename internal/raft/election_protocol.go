@@ -98,10 +98,7 @@ func (r *Raft) StartElection(
 		// A single-member cluster already has a quorum.
 		if hasElectionMajority(next.electionVotes, len(peers)+1) {
 			next.role = Leader
-			next.nextIndex = make(map[string]uint64)
-			next.matchIndex = make(map[string]uint64)
-
-			result.next = next
+			appendLeaderNoop(&next, r.id, peers, &result)
 			return result, nil
 		}
 
@@ -211,20 +208,7 @@ func (r *Raft) HandleRequestVoteResponse(
 		if hasElectionMajority(next.electionVotes, clusterSize) {
 			next.role = Leader
 
-			lastIndex, _ := lastLogInfo(next.log)
-
-			next.nextIndex = make(map[string]uint64, len(peers))
-			next.matchIndex = make(map[string]uint64, len(peers))
-
-			for _, peer := range peers {
-				next.nextIndex[peer] = lastIndex + 1
-				next.matchIndex[peer] = 0
-			}
-
-			// Heartbeat execution and the leader's
-			// initial current-term NOOP entry will be
-			// connected to the replication protocol.
-			result.effects.ResetHeartbeatTimer = true
+			appendLeaderNoop(&next, r.id, peers, &result)
 		}
 
 		result.next = next

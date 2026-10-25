@@ -30,6 +30,8 @@ type eventEnvelope struct {
 
 type eventResult struct {
 	effects        Effects
+	proposalIndex  uint64
+	proposalTerm   uint64
 	voteResponse   *RequestVoteResponse
 	appendResponse *AppendEntriesResponse
 	err            error
@@ -43,6 +45,7 @@ type Runtime struct {
 
 	events      chan eventEnvelope
 	effectQueue *EffectQueue
+	applyFn     func(LogEntry) error
 
 	mu      sync.Mutex
 	started bool
@@ -149,6 +152,10 @@ func (rt *Runtime) Start() error {
 		return errors.New("raft runtime requires an effect queue")
 	}
 
+	// Recover the committed state machine before accepting new RPCs.
+	if err := rt.applyCommitted(); err != nil {
+		return fmt.Errorf("recover committed entries: %w", err)
+	}
 	rt.started = true
 
 	go rt.run()
@@ -331,6 +338,15 @@ func (rt *Runtime) run() {
 			return
 
 		case envelope := <-rt.events:
+			// Failure of the external effect worker makes further Raft
+			// operations unsafe even when queue admission succeeded earlier.
+			if err := rt.effectQueue.Err(); err != nil {
+				rt.raft.mu.Lock()
+				rt.raft.failed = true
+				rt.raft.mu.Unlock()
+				envelope.reply <- eventResult{err: err}
+				continue
+			}
 			select {
 			case <-rt.stopCh:
 				envelope.reply <- eventResult{
@@ -347,6 +363,15 @@ func (rt *Runtime) run() {
 			)
 			if err != nil {
 				envelope.reply <- eventResult{err: err}
+				continue
+			}
+
+			// Apply committed entries in log order before acknowledging.
+			if err := rt.applyCommitted(); err != nil {
+				rt.raft.mu.Lock()
+				rt.raft.failed = true
+				rt.raft.mu.Unlock()
+				envelope.reply <- eventResult{err: fmt.Errorf("apply committed Raft entries: %w", err)}
 				continue
 			}
 
@@ -377,6 +402,8 @@ func (rt *Runtime) run() {
 			envelope.reply <- eventResult{
 				voteResponse:   outcome.VoteResponse,
 				appendResponse: outcome.AppendResponse,
+				proposalIndex:  outcome.ProposalIndex,
+				proposalTerm:   outcome.ProposalTerm,
 			}
 		}
 	}
@@ -535,4 +562,130 @@ func (rt *Runtime) Stop(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// SetApplyFunc configures the ordered state-machine callback before startup.
+// The callback must be idempotent: committed entries are replayed on restart.
+func (rt *Runtime) SetApplyFunc(fn func(LogEntry) error) error {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if rt.started || rt.stopped {
+		return ErrRuntimeStarted
+	}
+	rt.applyFn = fn
+	return nil
+}
+
+// applyCommitted executes only committed entries, including replay on restart.
+// Called by the single runtime worker, or Start before workers exist.
+func (rt *Runtime) applyCommitted() error {
+	for {
+		rt.raft.mu.RLock()
+		if rt.raft.failed {
+			rt.raft.mu.RUnlock()
+			return ErrStorageFailed
+		}
+		if rt.raft.lastApplied >= rt.raft.commitIndex {
+			rt.raft.mu.RUnlock()
+			return nil
+		}
+		index := rt.raft.lastApplied + 1
+		entry := rt.raft.log[index-1]
+		rt.raft.mu.RUnlock()
+		if entry.Command.Type != CommandNoop {
+			if rt.applyFn == nil {
+				return errors.New("committed KV command requires SetApplyFunc")
+			}
+			if err := rt.applyFn(entry); err != nil {
+				return err
+			}
+		}
+		rt.raft.mu.Lock()
+		if rt.raft.lastApplied+1 == index {
+			rt.raft.lastApplied = index
+		}
+		rt.raft.mu.Unlock()
+	}
+}
+
+// Propose appends a client command and waits for majority commitment and local
+// state-machine application. Context expiration makes the outcome uncertain.
+func (rt *Runtime) Propose(ctx context.Context, cmd Command) (uint64, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if cmd.Type == CommandNoop {
+		return 0, fmt.Errorf("%w: NOOP is reserved", ErrInvalidEvent)
+	}
+	return rt.proposeEntry(ctx, cmd)
+}
+
+// proposeEntry submits an internal or client command and waits for its
+// commitment and ordered application. Internal barriers may use NOOP.
+func (rt *Runtime) proposeEntry(ctx context.Context, cmd Command) (uint64, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	result, err := rt.submit(ctx, Event{Type: EventClientProposal, Proposal: &cmd})
+	if err != nil {
+		return 0, err
+	}
+	if result.proposalIndex == 0 {
+		return 0, ErrInvalidTransition
+	}
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		rt.raft.mu.RLock()
+		applied := rt.raft.lastApplied >= result.proposalIndex
+		matching := result.proposalIndex <= uint64(len(rt.raft.log)) &&
+			rt.raft.log[result.proposalIndex-1].Term == result.proposalTerm &&
+			rt.raft.log[result.proposalIndex-1].Command == cmd
+		role, failed := rt.raft.role, rt.raft.failed
+		rt.raft.mu.RUnlock()
+		if failed {
+			return result.proposalIndex, ErrStorageFailed
+		}
+		if applied && matching {
+			return result.proposalIndex, nil
+		}
+		if role != Leader || !matching {
+			return result.proposalIndex, ErrNotLeader
+		}
+		select {
+		case <-ctx.Done():
+			return result.proposalIndex, ctx.Err()
+		case <-rt.stopCh:
+			return result.proposalIndex, ErrRuntimeStopped
+		case <-ticker.C:
+		}
+	}
+}
+
+// ReadBarrier commits a current-term NOOP through a majority before allowing a
+// leader read. Callers must perform the KV lookup promptly and check leadership.
+func (rt *Runtime) ReadBarrier(ctx context.Context) error {
+	_, err := rt.proposeEntry(ctx, Command{Type: CommandNoop})
+	return err
+}
+
+// LinearizableRead performs a quorum barrier and then reads the applied KV
+// state. A value returned by read must come from the same synchronized state
+// machine configured through SetApplyFunc.
+func (rt *Runtime) LinearizableRead(ctx context.Context, read func() (string, bool)) (string, bool, error) {
+	if read == nil {
+		return "", false, errors.New("nil read callback")
+	}
+	if err := rt.ReadBarrier(ctx); err != nil {
+		return "", false, err
+	}
+	term := rt.raft.CurrentTerm()
+	value, found := read()
+	rt.raft.mu.RLock()
+	valid := !rt.raft.failed && rt.raft.role == Leader && rt.raft.currentTerm == term
+	rt.raft.mu.RUnlock()
+	if !valid {
+		return "", false, ErrNotLeader
+	}
+	return value, found, nil
 }

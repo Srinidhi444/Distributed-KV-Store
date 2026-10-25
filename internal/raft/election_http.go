@@ -18,8 +18,7 @@ const (
 	appendEntriesPath = "/internal/raft/append-entries"
 )
 
-// NewElectionHTTPHandler creates HTTP endpoints for incoming
-// RequestVote and AppendEntries RPCs.
+// NewElectionHTTPHandler registers incoming Raft vote and replication RPCs.
 //
 // Both endpoints delegate state changes to the serialized
 // Raft runtime, which persists required changes before replying.
@@ -34,7 +33,7 @@ func NewElectionHTTPHandler(rt *Runtime) http.Handler {
 		defer r.Body.Close()
 
 		var request RequestVoteRequest
-		decoder := json.NewDecoder(io.LimitReader(r.Body, 64<<10))
+		decoder := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
 		decoder.DisallowUnknownFields()
 
 		if err := decoder.Decode(&request); err != nil {
@@ -62,14 +61,12 @@ func NewElectionHTTPHandler(rt *Runtime) http.Handler {
 		_ = json.NewEncoder(w).Encode(response)
 	})
 
-	// Process incoming AppendEntries requests.
-	// For now, only empty AppendEntries (heartbeats)
-	// are supported.
+	// Process both empty heartbeats and entries carrying log updates.
 	mux.HandleFunc("POST "+appendEntriesPath, func(w http.ResponseWriter, r *http.Request) {
 		defer r.Body.Close()
 
 		var request AppendEntriesRequest
-		decoder := json.NewDecoder(io.LimitReader(r.Body, 64<<10))
+		decoder := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
 		decoder.DisallowUnknownFields()
 
 		if err := decoder.Decode(&request); err != nil {
@@ -100,8 +97,7 @@ func NewElectionHTTPHandler(rt *Runtime) http.Handler {
 	return mux
 }
 
-// NewElectionEffectHandler creates an effect handler that
-// sends outgoing RequestVote and heartbeat RPCs.
+// NewElectionEffectHandler sends RequestVote and AppendEntries RPCs.
 //
 // Network calls run in separate goroutines so slow peers
 // do not block the ordered effect queue.
@@ -170,12 +166,11 @@ func NewElectionEffectHandler(
 				go sendRequestVote(rt, client, address, message)
 
 			case MessageAppendEntries:
-				if message.AppendEntries == nil ||
-					len(message.AppendEntries.Entries) != 0 {
-					return errors.New("expected heartbeat payload")
+				if message.AppendEntries == nil {
+					return errors.New("missing AppendEntries payload")
 				}
 
-				go sendHeartbeat(rt, client, address, message)
+				go sendAppendEntries(rt, client, address, message)
 
 			default:
 				return fmt.Errorf(
@@ -266,11 +261,9 @@ func sendRequestVote(
 	submitRPCResponse(rt, ctx, event)
 }
 
-// sendHeartbeat sends an empty AppendEntries request to
-// one follower and reports its response to the Raft runtime.
-//
-// Only active leaders send heartbeats.
-func sendHeartbeat(
+// sendAppendEntries sends a heartbeat or log replication request and
+// correlates the response with the exact suffix originally sent.
+func sendAppendEntries(
 	rt *Runtime,
 	client *http.Client,
 	address string,
@@ -337,6 +330,8 @@ func sendHeartbeat(
 		Type:                  EventAppendEntriesResponse,
 		From:                  message.To,
 		RequestID:             request.Term,
+		SentPrevLogIndex:      request.PrevLogIndex,
+		SentLastIndex:         request.PrevLogIndex + uint64(len(request.Entries)),
 		AppendEntriesResponse: &response,
 	}
 

@@ -1,6 +1,8 @@
 package raft
 
 import (
+	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 )
@@ -139,5 +141,69 @@ func TestHigherTermResponseStepsDown(t *testing.T) {
 	}
 	if state.HardState.CurrentTerm != 5 {
 		t.Fatalf("higher term not persisted")
+	}
+}
+
+// TestMergeLogEntries exercises append, identical-prefix, conflict and
+// committed-prefix safety using real entry payloads.
+func TestMergeLogEntries(t *testing.T) {
+	mk := func(index, term uint64) LogEntry {
+		return LogEntry{Index: index, Term: term, Command: Command{Type: CommandSet, Key: "k", Value: fmt.Sprint(term)}}
+	}
+	initial := []LogEntry{mk(1, 1), mk(2, 1), mk(3, 2), mk(4, 2), mk(5, 2)}
+	incoming := []LogEntry{mk(4, 3), mk(5, 3)}
+	result, err := mergeLogEntries(initial, incoming, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result) != 5 || result[3].Term != 3 || result[4].Term != 3 || initial[3].Term != 2 {
+		t.Fatalf("bad logical suffix replacement: %v", result)
+	}
+	if _, err := mergeLogEntries(initial, []LogEntry{mk(3, 3)}, 3); !errors.Is(err, ErrCommittedEntry) {
+		t.Fatalf("expected committed overwrite error, got %v", err)
+	}
+	same, err := mergeLogEntries(initial, []LogEntry{mk(3, 2), mk(4, 2)}, 2)
+	if err != nil || len(same) != 5 || same[4] != initial[4] {
+		t.Fatalf("identical prefix truncated trailing entries: %v, %v", same, err)
+	}
+	if _, err := mergeLogEntries(initial, []LogEntry{mk(7, 4)}, 2); err == nil {
+		t.Fatal("accepted a gap")
+	}
+	altered := mk(4, 2)
+	altered.Command.Value = "evil"
+	if _, err := mergeLogEntries(initial, []LogEntry{altered}, 3); err == nil {
+		t.Fatal("accepted different command for identical index and term")
+	}
+}
+
+// TestAppendEntriesRejectsDivergentCommit prevents commitment of a follower's
+// trailing entries that were not proven to match the leader.
+func TestAppendEntriesRejectsDivergentCommit(t *testing.T) {
+	current := raftState{role: Follower, currentTerm: 3, log: []LogEntry{
+		{Index: 1, Term: 1, Command: Command{Type: CommandNoop}},
+		{Index: 2, Term: 2, Command: Command{Type: CommandNoop}},
+		{Index: 3, Term: 2, Command: Command{Type: CommandNoop}},
+	}}
+	next, resp, _, err := evaluateAppendEntries(current, AppendEntriesRequest{Term: 3, LeaderID: "node2", PrevLogIndex: 1, PrevLogTerm: 1, LeaderCommit: 3})
+	if err != nil || !resp.Success || next.commitIndex != 1 {
+		t.Fatalf("advanced commit beyond proven prefix: %v, %+v, %v", next.commitIndex, resp, err)
+	}
+}
+
+// TestCommitCurrentTermOnly verifies that prior-term entries are never
+// committed by replica counting alone.
+func TestCommitCurrentTermOnly(t *testing.T) {
+	entries := []LogEntry{
+		{Index: 1, Term: 1, Command: Command{Type: CommandNoop}},
+		{Index: 2, Term: 2, Command: Command{Type: CommandNoop}},
+	}
+	s := raftState{role: Leader, currentTerm: 3, log: entries, matchIndex: map[string]uint64{"n2": 2, "n3": 1}}
+	if advanceLeaderCommit(&s, []string{"n2", "n3"}) || s.commitIndex != 0 {
+		t.Fatal("incorrectly committed prior-term entry")
+	}
+	s.log = append(s.log, LogEntry{Index: 3, Term: 3, Command: Command{Type: CommandNoop}})
+	s.matchIndex["n2"] = 3
+	if !advanceLeaderCommit(&s, []string{"n2", "n3"}) || s.commitIndex != 3 {
+		t.Fatal("failed to commit current-term entry")
 	}
 }

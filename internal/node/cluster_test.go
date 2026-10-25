@@ -3,7 +3,7 @@ package node
 import (
 	"context"
 	"errors"
-	"fmt"
+	"github.com/Srinidhi444/Distributed-KV-Store/internal/raft"
 	"net/http"
 	"path/filepath"
 	"testing"
@@ -211,71 +211,107 @@ func TestThreeNodeClusterPeerFailureAndRestart(t *testing.T) {
 	pingClusterPeer(t, restartedNode2, "node3")
 }
 
-func TestThreeNodeClusterStorageIsolation(t *testing.T) {
+// TestThreeNodeClusterReplicatedWrites proves all three nodes share one committed log.
+func TestThreeNodeClusterReplicatedWrites(t *testing.T) {
 	configs := clusterConfigs(t)
-
-	nodes := make([]*Node, 0, len(configs))
-
+	nodes := make([]*Node, 0, 3)
 	for _, cfg := range configs {
 		nodes = append(nodes, startClusterNode(t, cfg))
 	}
+	var leader *Node
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		count := 0
+		leader = nil
+		for _, n := range nodes {
+			if n.raftNode.Role() == raft.Leader {
+				count++
+				leader = n
+			}
+		}
+		if count == 1 {
+			break
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+	if leader == nil {
+		t.Fatal("no leader elected")
+	}
+	status, _ := httpRequest(t, http.MethodPut, nodeURL(leader, "/kv/shared"), `{"value":"replicated"}`)
+	if status != http.StatusOK {
+		t.Fatalf("leader PUT returned %d", status)
+	}
+	deadline = time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		matched := 0
+		for _, n := range nodes {
+			if v, ok := n.db.Get("shared"); ok && v == "replicated" {
+				matched++
+			}
+		}
+		if matched == 3 {
+			return
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+	t.Fatal("followers never applied committed value")
+}
 
-	// Write a distinct value to each node through HTTP.
-	for i, n := range nodes {
-		value := fmt.Sprintf("value-%d", i+1)
-
-		status, _ := httpRequest(
-			t,
-			http.MethodPut,
-			nodeURL(n, "/kv/shared"),
-			fmt.Sprintf(`{"value":%q}`, value),
-		)
-
-		if status < 200 || status >= 300 {
-			t.Fatalf(
-				"PUT to %s failed: HTTP %d",
-				n.cfg.NodeID,
-				status,
-			)
+// TestClusterFailoverAndRestart checks public writes, leadership replacement,
+// and WAL replay into the restarted node's state machine.
+func TestClusterFailoverAndRestart(t *testing.T) {
+	configs := clusterConfigs(t)
+	nodes := make([]*Node, 0, 3)
+	for _, cfg := range configs {
+		nodes = append(nodes, startClusterNode(t, cfg))
+	}
+	waitUniqueLeader := func(except *Node) *Node {
+		t.Helper()
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			var selected *Node
+			count := 0
+			for _, n := range nodes {
+				if n != except && !n.stopped && n.raftNode.Role() == raft.Leader {
+					selected = n
+					count++
+				}
+			}
+			if count == 1 {
+				return selected
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+		t.Fatal("cluster failed to elect a unique leader")
+		return nil
+	}
+	oldLeader := waitUniqueLeader(nil)
+	status, _ := httpRequest(t, http.MethodPut, nodeURL(oldLeader, "/kv/pre"), `{"value":"before"}`)
+	if status != http.StatusOK {
+		t.Fatalf("initial write: HTTP %d", status)
+	}
+	shutdownClusterNode(t, oldLeader)
+	leader := waitUniqueLeader(oldLeader)
+	status, _ = httpRequest(t, http.MethodPut, nodeURL(leader, "/kv/post"), `{"value":"after"}`)
+	if status != http.StatusOK {
+		t.Fatalf("new leader write: HTTP %d", status)
+	}
+	var oldConfig config.Config
+	for _, cfg := range configs {
+		if cfg.NodeID == oldLeader.cfg.NodeID {
+			oldConfig = cfg
+			break
 		}
 	}
-
-	// Verify each node has its own value.
-	for i, n := range nodes {
-		expected := fmt.Sprintf("value-%d", i+1)
-
-		value, exists := n.db.Get("shared")
-
-		if !exists || value != expected {
-			t.Fatalf(
-				"%s: expected %q, got %q",
-				n.cfg.NodeID,
-				expected,
-				value,
-			)
+	restarted := startClusterNode(t, oldConfig)
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		before, ok1 := restarted.db.Get("pre")
+		after, ok2 := restarted.db.Get("post")
+		if ok1 && ok2 && before == "before" && after == "after" {
+			return
 		}
+		time.Sleep(25 * time.Millisecond)
 	}
-
-	// Stop every node, releasing its WAL.
-	for _, n := range nodes {
-		shutdownClusterNode(t, n)
-	}
-
-	// Restart and verify independent recovery.
-	for i, cfg := range configs {
-		restarted := startClusterNode(t, cfg)
-
-		expected := fmt.Sprintf("value-%d", i+1)
-
-		value, exists := restarted.db.Get("shared")
-
-		if !exists || value != expected {
-			t.Fatalf(
-				"%s: expected recovered value %q, got %q",
-				cfg.NodeID,
-				expected,
-				value,
-			)
-		}
-	}
+	t.Fatal("restarted node did not replay and catch up with committed writes")
 }

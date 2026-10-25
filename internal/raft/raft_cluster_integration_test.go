@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -18,6 +19,8 @@ func TestElectionCluster(t *testing.T) {
 	type member struct {
 		id      string
 		path    string
+		kvMu    sync.Mutex
+		kv      map[string]string
 		server  *httptest.Server
 		active  atomic.Pointer[Runtime]
 		raft    *Raft
@@ -27,7 +30,7 @@ func TestElectionCluster(t *testing.T) {
 	}
 	members := make([]*member, n)
 	for i := range members {
-		m := &member{id: fmt.Sprintf("node%d", i+1), path: filepath.Join(t.TempDir(), fmt.Sprintf("node%d.raft", i+1))}
+		m := &member{id: fmt.Sprintf("node%d", i+1), path: filepath.Join(t.TempDir(), fmt.Sprintf("node%d.raft", i+1)), kv: make(map[string]string)}
 		members[i] = m
 		m.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			rt := m.active.Load()
@@ -79,6 +82,19 @@ func TestElectionCluster(t *testing.T) {
 		rt, err := NewElectionRuntime(raftNode, peerIDs, 256)
 		if err != nil {
 			storage.Close()
+			t.Fatal(err)
+		}
+		if err := rt.SetApplyFunc(func(entry LogEntry) error {
+			m.kvMu.Lock()
+			defer m.kvMu.Unlock()
+			switch entry.Command.Type {
+			case CommandSet:
+				m.kv[entry.Command.Key] = entry.Command.Value
+			case CommandDelete:
+				delete(m.kv, entry.Command.Key)
+			}
+			return nil
+		}); err != nil {
 			t.Fatal(err)
 		}
 		handler, err := NewElectionEffectHandler(rt, peerURLs)
@@ -150,6 +166,51 @@ func TestElectionCluster(t *testing.T) {
 			t.Fatalf("%s isn't follower during stable leadership: %v", m.id, m.raft.Role())
 		}
 	}
+	// Persist, replicate, commit and apply a real client command.
+	writeCtx, writeCancel := context.WithTimeout(context.Background(), 8*time.Second)
+	index, err := first.runtime.Propose(writeCtx, Command{Type: CommandSet, Key: "x", Value: "42"})
+	writeCancel()
+	if err != nil {
+		t.Fatalf("replicated SET failed: %v", err)
+	}
+	if index == 0 {
+		t.Fatal("invalid committed index")
+	}
+	deadlineKV := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadlineKV) {
+		matched := 0
+		for _, m := range members {
+			m.kvMu.Lock()
+			if m.kv["x"] == "42" {
+				matched++
+			}
+			m.kvMu.Unlock()
+		}
+		if matched == 3 {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	for _, m := range members {
+		m.kvMu.Lock()
+		value := m.kv["x"]
+		m.kvMu.Unlock()
+		if value != "42" {
+			t.Fatalf("%s did not apply committed SET: %q", m.id, value)
+		}
+	}
+	// A quorum-backed read must observe the committed value.
+	readCtx, readCancel := context.WithTimeout(context.Background(), 8*time.Second)
+	value, found, readErr := first.runtime.LinearizableRead(readCtx, func() (string, bool) {
+		first.kvMu.Lock()
+		defer first.kvMu.Unlock()
+		v, ok := first.kv["x"]
+		return v, ok
+	})
+	readCancel()
+	if readErr != nil || !found || value != "42" {
+		t.Fatalf("linearizable read: value %q, found=%v, err=%v", value, found, readErr)
+	}
 	oldTerm := first.raft.CurrentTerm()
 	stop(first)
 	replacement := waitLeader(first)
@@ -158,7 +219,30 @@ func TestElectionCluster(t *testing.T) {
 	}
 	t.Logf("replacement leader: %s (term %d)", replacement.id, replacement.raft.CurrentTerm())
 
+	// Commit a write under the replacement leader while the original
+	// leader is offline; its log must catch up after restart.
+	failoverCtx, failoverCancel := context.WithTimeout(context.Background(), 8*time.Second)
+	if _, err := replacement.runtime.Propose(failoverCtx, Command{Type: CommandSet, Key: "after", Value: "failover"}); err != nil {
+		t.Fatalf("replacement leader write: %v", err)
+	}
+	failoverCancel()
 	start(first)
+	deadlineCatchup := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadlineCatchup) {
+		first.kvMu.Lock()
+		got := first.kv["after"]
+		first.kvMu.Unlock()
+		if got == "failover" {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	first.kvMu.Lock()
+	caughtUp := first.kv["after"] == "failover"
+	first.kvMu.Unlock()
+	if !caughtUp {
+		t.Fatal("restarted previous leader failed to replicate new leader's SET")
+	}
 	// The old leader must learn the newer term and remain follower.
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {

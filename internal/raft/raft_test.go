@@ -210,3 +210,30 @@ func TestRaftConcurrentAccessors(t *testing.T) {
 		t.Fatalf("expected final role Candidate, got %v", got)
 	}
 }
+
+// TestHeartbeatAckDoesNotTriggerAnotherHeartbeat prevents a response->request
+// feedback loop that otherwise creates unbounded HTTP goroutines.
+func TestHeartbeatAckDoesNotTriggerAnotherHeartbeat(t *testing.T) {
+	r := New("node1")
+	r.role = Leader
+	r.currentTerm = 1
+	r.log = []LogEntry{{Index: 1, Term: 1, Command: Command{Type: CommandNoop}}}
+	r.commitIndex = 1
+	r.matchIndex["node2"] = 1
+	r.nextIndex["node2"] = 2
+
+	effects, err := r.handleAppendEntriesResponse(Event{
+		Type:                  EventAppendEntriesResponse,
+		From:                  "node2",
+		RequestID:             1,
+		SentPrevLogIndex:      1,
+		SentLastIndex:         1,
+		AppendEntriesResponse: &AppendEntriesResponse{Term: 1, Success: true, MatchIndex: 1},
+	}, []string{"node2", "node3"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(effects.Messages) != 0 {
+		t.Fatalf("up-to-date follower caused %d redundant RPCs", len(effects.Messages))
+	}
+}
