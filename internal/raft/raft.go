@@ -32,8 +32,9 @@ type Raft struct {
 
 	// Durable Raft storage.
 	// Nil only for instances created with New().
-	storage Storage
-	failed  bool
+	storage       Storage
+	electionVotes map[string]bool
+	failed        bool
 }
 
 // New creates an in-memory Raft instance.
@@ -149,14 +150,15 @@ func (r *Raft) CurrentTerm() uint64 {
 // Caller must hold r.mu.
 func (r *Raft) snapshotStateLocked() raftState {
 	return cloneRaftState(raftState{
-		role:        r.role,
-		currentTerm: r.currentTerm,
-		votedFor:    r.votedFor,
-		log:         r.log,
-		commitIndex: r.commitIndex,
-		lastApplied: r.lastApplied,
-		nextIndex:   r.nextIndex,
-		matchIndex:  r.matchIndex,
+		role:          r.role,
+		currentTerm:   r.currentTerm,
+		votedFor:      r.votedFor,
+		log:           r.log,
+		commitIndex:   r.commitIndex,
+		lastApplied:   r.lastApplied,
+		nextIndex:     r.nextIndex,
+		matchIndex:    r.matchIndex,
+		electionVotes: r.electionVotes,
 	})
 }
 
@@ -170,6 +172,11 @@ func (r *Raft) publishStateLocked(state raftState) {
 	r.votedFor = state.votedFor
 	r.commitIndex = state.commitIndex
 	r.lastApplied = state.lastApplied
+	r.electionVotes = make(map[string]bool, len(state.electionVotes))
+
+	for peer, granted := range state.electionVotes {
+		r.electionVotes[peer] = granted
+	}
 
 	// Deep copy the log slice so it's not shared with external or recovered state.
 	if state.log != nil {

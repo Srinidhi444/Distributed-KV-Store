@@ -15,8 +15,9 @@ type raftState struct {
 	commitIndex uint64
 	lastApplied uint64
 
-	nextIndex  map[string]uint64
-	matchIndex map[string]uint64
+	nextIndex     map[string]uint64
+	matchIndex    map[string]uint64
+	electionVotes map[string]bool
 }
 
 // Transition describes one proposed Raft state change
@@ -33,6 +34,11 @@ func cloneRaftState(state raftState) raftState {
 	next := state
 	next.log = append([]LogEntry(nil), state.log...)
 	next.nextIndex = make(map[string]uint64, len(state.nextIndex))
+	next.electionVotes = make(map[string]bool, len(state.electionVotes))
+
+	for peer, granted := range state.electionVotes {
+		next.electionVotes[peer] = granted
+	}
 	for peer, index := range state.nextIndex {
 		next.nextIndex[peer] = index
 	}
