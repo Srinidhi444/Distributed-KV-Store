@@ -1,7 +1,5 @@
 package raft
 
-// EventType identifies the kind of event received
-// by the Raft consensus engine.
 type EventType uint8
 
 const (
@@ -14,12 +12,18 @@ const (
 	EventClientProposal
 )
 
-// Event represents one input to the Raft engine.
+// Event is one input to the Raft state machine.
 //
-// Exactly one payload should be populated for events
-// that require additional data.
+// From identifies the authenticated/validated peer that
+// supplied an RPC or response.
+//
+// RequestID correlates a response with an outstanding
+// request in the local runtime.
 type Event struct {
 	Type EventType
+
+	From      string
+	RequestID uint64
 
 	RequestVote         *RequestVoteRequest
 	RequestVoteResponse *RequestVoteResponse
