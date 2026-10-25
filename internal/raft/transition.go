@@ -28,3 +28,17 @@ type Transition struct {
 	next    raftState
 	effects Effects
 }
+
+func cloneRaftState(state raftState) raftState {
+	next := state
+	next.log = append([]LogEntry(nil), state.log...)
+	next.nextIndex = make(map[string]uint64, len(state.nextIndex))
+	for peer, index := range state.nextIndex {
+		next.nextIndex[peer] = index
+	}
+	next.matchIndex = make(map[string]uint64, len(state.matchIndex))
+	for peer, index := range state.matchIndex {
+		next.matchIndex[peer] = index
+	}
+	return next
+}

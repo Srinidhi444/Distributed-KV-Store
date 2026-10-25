@@ -7,6 +7,7 @@ import (
 	"sync"
 )
 
+type transitionPlanner func(raftState) (Transition, error)
 type Raft struct {
 	mu sync.RWMutex
 
@@ -32,6 +33,7 @@ type Raft struct {
 	// Durable Raft storage.
 	// Nil only for instances created with New().
 	storage Storage
+	failed  bool
 }
 
 // New creates an in-memory Raft instance.
@@ -140,4 +142,142 @@ func (r *Raft) CurrentTerm() uint64 {
 	defer r.mu.RUnlock()
 
 	return r.currentTerm
+}
+
+// snapshotStateLocked captures the live Raft state.
+//
+// Caller must hold r.mu.
+func (r *Raft) snapshotStateLocked() raftState {
+	return cloneRaftState(raftState{
+		role:        r.role,
+		currentTerm: r.currentTerm,
+		votedFor:    r.votedFor,
+		log:         r.log,
+		commitIndex: r.commitIndex,
+		lastApplied: r.lastApplied,
+		nextIndex:   r.nextIndex,
+		matchIndex:  r.matchIndex,
+	})
+}
+
+// publishStateLocked replaces live state after persistence.
+//
+// Caller must hold r.mu.
+func (r *Raft) publishStateLocked(state raftState) {
+	// Copy scalar and value fields.
+	r.role = state.role
+	r.currentTerm = state.currentTerm
+	r.votedFor = state.votedFor
+	r.commitIndex = state.commitIndex
+	r.lastApplied = state.lastApplied
+
+	// Deep copy the log slice so it's not shared with external or recovered state.
+	if state.log != nil {
+		r.log = append([]LogEntry(nil), state.log...)
+	} else {
+		r.log = make([]LogEntry, 0)
+	}
+
+	// Deep copy the nextIndex map.
+	if state.nextIndex != nil {
+		r.nextIndex = make(map[string]uint64, len(state.nextIndex))
+		for k, v := range state.nextIndex {
+			r.nextIndex[k] = v
+		}
+	} else {
+		r.nextIndex = make(map[string]uint64)
+	}
+
+	// Deep copy the matchIndex map.
+	if state.matchIndex != nil {
+		r.matchIndex = make(map[string]uint64, len(state.matchIndex))
+		for k, v := range state.matchIndex {
+			r.matchIndex[k] = v
+		}
+	} else {
+		r.matchIndex = make(map[string]uint64)
+	}
+}
+
+func (r *Raft) processTransition(
+	planner transitionPlanner,
+) (Effects, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// 1. Reject transitions after a fatal storage failure.
+	if r.failed {
+		return Effects{}, ErrStorageFailed
+	}
+
+	if planner == nil {
+		return Effects{}, fmt.Errorf(
+			"%w: nil transition planner",
+			ErrInvalidTransition,
+		)
+	}
+
+	// 2. Capture an independent copy of the current state.
+	current := r.snapshotStateLocked()
+
+	// 3. Give the planner a separate copy so it cannot
+	// accidentally mutate the state used for validation.
+	planningState := cloneRaftState(current)
+
+	transition, err := planner(planningState)
+	if err != nil {
+		return Effects{}, fmt.Errorf(
+			"plan raft transition: %w",
+			err,
+		)
+	}
+
+	// 4. Verify that the proposed state and persistence
+	// effects are consistent.
+	if err := validateTransition(current, transition); err != nil {
+		return Effects{}, fmt.Errorf(
+			"validate raft transition: %w",
+			err,
+		)
+	}
+
+	// 5. Persist required changes before publication.
+	if transition.effects.Persist != nil {
+		if r.storage == nil {
+			return Effects{}, fmt.Errorf(
+				"%w: persistent transition requires storage",
+				ErrInvalidTransition,
+			)
+		}
+
+		effect := transition.effects.Persist
+
+		err := r.storage.Save(
+			effect.HardState,
+			effect.Entries,
+		)
+		if err != nil {
+			// A persistence failure may have an uncertain
+			// outcome. Stop processing further transitions
+			// until the node is recovered.
+			r.failed = true
+
+			return Effects{}, fmt.Errorf(
+				"persist raft transition: %w",
+				err,
+			)
+		}
+	}
+
+	// 6. Publish only after successful persistence.
+	r.publishStateLocked(transition.next)
+
+	// 7. Return effects for the runtime to execute.
+	//
+	// The persistence effect has already been handled.
+	// The runtime must not execute it a second time.
+	effects := transition.effects
+	effects.Persist = nil
+
+	return effects, nil
 }
