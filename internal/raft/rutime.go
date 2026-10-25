@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"sync"
+	"time"
 )
 
 var (
@@ -15,43 +17,47 @@ var (
 	ErrRuntimeStarted    = errors.New("raft runtime already started")
 )
 
+const (
+	minElectionTimeout = 300 * time.Millisecond
+	maxElectionTimeout = 600 * time.Millisecond
+	heartbeatInterval  = 100 * time.Millisecond
+)
+
 type eventEnvelope struct {
 	event Event
 	reply chan eventResult
 }
 
 type eventResult struct {
-	effects Effects
-	err     error
+	effects        Effects
+	voteResponse   *RequestVoteResponse
+	appendResponse *AppendEntriesResponse
+	err            error
 }
 
-// Runtime owns a serialized queue of Raft events.
-//
-// Lifecycle:
-//   - NewRuntime creates the runtime.
-//   - Start launches one event-processing goroutine.
-//   - Submit admits events while the runtime is active.
-//   - Stop prevents new submissions and terminates the loop.
-//
-// The events channel is never closed by Submit or Stop.
+// Runtime processes Raft events sequentially and manages
+// election timers and ordered effect delivery.
 type Runtime struct {
-	raft *Raft
+	raft  *Raft
+	peers []string
 
-	events chan eventEnvelope
+	events      chan eventEnvelope
+	effectQueue *EffectQueue
 
 	mu      sync.Mutex
 	started bool
 	stopped bool
 
-	// Closed once shutdown begins.
 	stopCh chan struct{}
+	done   chan struct{}
 
-	// Closed when the event-processing goroutine exits,
-	// or immediately if stopped before startup.
-	done chan struct{}
+	timerReset    chan struct{}
+	timerDone     chan struct{}
+	heartbeatDone chan struct{}
 }
 
-// NewRuntime creates a runtime without starting it.
+// NewRuntime creates an unstarted runtime with a bounded
+// event queue and initialized lifecycle channels.
 func NewRuntime(r *Raft, queueSize int) (*Runtime, error) {
 	if r == nil {
 		return nil, errors.New("raft instance cannot be nil")
@@ -65,14 +71,68 @@ func NewRuntime(r *Raft, queueSize int) (*Runtime, error) {
 	}
 
 	return &Runtime{
-		raft:   r,
-		events: make(chan eventEnvelope, queueSize),
-		stopCh: make(chan struct{}),
-		done:   make(chan struct{}),
+		raft:          r,
+		events:        make(chan eventEnvelope, queueSize),
+		stopCh:        make(chan struct{}),
+		done:          make(chan struct{}),
+		timerReset:    make(chan struct{}, 1),
+		timerDone:     make(chan struct{}),
+		heartbeatDone: make(chan struct{}),
 	}, nil
 }
 
-// Start launches exactly one event-processing goroutine.
+// NewElectionRuntime creates a runtime with a fixed set
+// of voting peers, excluding the local node.
+func NewElectionRuntime(
+	r *Raft,
+	peers []string,
+	queueSize int,
+) (*Runtime, error) {
+	if r == nil {
+		return nil, errors.New("raft instance cannot be nil")
+	}
+
+	if err := validateElectionMembers(r.ID(), peers); err != nil {
+		return nil, err
+	}
+
+	rt, err := NewRuntime(r, queueSize)
+	if err != nil {
+		return nil, err
+	}
+
+	rt.peers = append([]string(nil), peers...)
+	return rt, nil
+}
+
+// SetEffectQueue attaches the effect executor before
+// startup. The executor cannot be replaced while running.
+func (rt *Runtime) SetEffectQueue(q *EffectQueue) error {
+	if q == nil {
+		return errors.New("effect queue cannot be nil")
+	}
+
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+
+	if rt.stopped {
+		return ErrRuntimeStopped
+	}
+
+	if rt.started {
+		return ErrRuntimeStarted
+	}
+
+	if rt.effectQueue != nil {
+		return errors.New("effect queue already configured")
+	}
+
+	rt.effectQueue = q
+	return nil
+}
+
+// Start launches one event-processing goroutine and one
+// randomized election-timer goroutine.
 func (rt *Runtime) Start() error {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
@@ -85,108 +145,179 @@ func (rt *Runtime) Start() error {
 		return ErrRuntimeStarted
 	}
 
+	if rt.effectQueue == nil {
+		return errors.New("raft runtime requires an effect queue")
+	}
+
 	rt.started = true
 
 	go rt.run()
+	go rt.runElectionTimer()
+	go rt.runHeartbeatTicker()
 
 	return nil
 }
 
-// Submit validates and submits an event.
+// submit validates an event, admits it to the queue,
+// and waits for processing, cancellation, or shutdown.
 //
-// Admission and shutdown are serialized by rt.mu.
-//
-// A successfully admitted event may still be canceled
-// before processing begins.
-//
-// Context cancellation does not undo any Raft transition
-// that has already started.
-func (rt *Runtime) Submit(
+// Cancellation after admission does not undo a
+// successfully persisted Raft transition.
+func (rt *Runtime) submit(
 	ctx context.Context,
 	event Event,
-) (Effects, error) {
+) (eventResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 
-	// Reject canceled requests before admission.
 	if err := ctx.Err(); err != nil {
-		return Effects{}, err
+		return eventResult{}, err
 	}
 
-	// Validate outside the lifecycle lock.
 	if err := validateEvent(event); err != nil {
-		return Effects{}, err
+		return eventResult{}, err
 	}
-
-	reply := make(chan eventResult, 1)
 
 	envelope := eventEnvelope{
 		event: event,
-		reply: reply,
+		reply: make(chan eventResult, 1),
 	}
 
-	// Serialize event admission against Stop().
 	rt.mu.Lock()
 
 	if rt.stopped {
 		rt.mu.Unlock()
-		return Effects{}, ErrRuntimeStopped
+		return eventResult{}, ErrRuntimeStopped
 	}
 
 	if !rt.started {
 		rt.mu.Unlock()
-		return Effects{}, ErrRuntimeNotStarted
+		return eventResult{}, ErrRuntimeNotStarted
 	}
 
-	// Nonblocking admission while holding rt.mu.
-	//
-	// Stop cannot mark the runtime stopped between
-	// this lifecycle check and queue admission.
+	// Admission and shutdown are serialized by mu.
 	select {
 	case rt.events <- envelope:
-		// Event accepted.
-
+		// Accepted.
 	default:
 		rt.mu.Unlock()
-		return Effects{}, ErrRuntimeBusy
+		return eventResult{}, ErrRuntimeBusy
 	}
 
 	rt.mu.Unlock()
 
-	// Wait for the processing result.
-	//
-	// The buffered reply channel allows the worker to
-	// respond even if the caller has already canceled.
 	select {
-	case result := <-reply:
-		return result.effects, result.err
+	case result := <-envelope.reply:
+		return result, result.err
 
 	case <-ctx.Done():
-		return Effects{}, ctx.Err()
+		return eventResult{}, ctx.Err()
 
 	case <-rt.stopCh:
-		// Prefer an available processing result.
+		// Prefer a result already produced by the worker.
 		select {
-		case result := <-reply:
-			return result.effects, result.err
+		case result := <-envelope.reply:
+			return result, result.err
 		default:
-			return Effects{}, ErrRuntimeStopped
+			return eventResult{}, ErrRuntimeStopped
 		}
 	}
 }
 
-// run processes events sequentially.
+// Submit handles internal events that do not require
+// a synchronous RPC response.
+func (rt *Runtime) Submit(
+	ctx context.Context,
+	event Event,
+) (Effects, error) {
+	if event.Type == EventRequestVote || event.Type == EventAppendEntries {
+		return Effects{}, fmt.Errorf(
+			"%w: use the dedicated RPC submission method",
+			ErrInvalidEvent,
+		)
+	}
+
+	result, err := rt.submit(ctx, event)
+	if err != nil {
+		return Effects{}, err
+	}
+
+	if result.voteResponse != nil || result.appendResponse != nil {
+		return Effects{}, fmt.Errorf(
+			"%w: unexpected RPC response",
+			ErrInvalidTransition,
+		)
+	}
+
+	return result.effects, nil
+}
+
+// SubmitRequestVote processes an incoming vote request
+// and returns its response after durable state changes
+// have completed.
+func (rt *Runtime) SubmitRequestVote(
+	ctx context.Context,
+	from string,
+	request RequestVoteRequest,
+) (RequestVoteResponse, Effects, error) {
+	result, err := rt.submit(ctx, Event{
+		Type:        EventRequestVote,
+		From:        from,
+		RequestVote: &request,
+	})
+	if err != nil {
+		return RequestVoteResponse{}, Effects{}, err
+	}
+
+	if result.voteResponse == nil {
+		return RequestVoteResponse{}, Effects{},
+			fmt.Errorf(
+				"%w: missing RequestVote response",
+				ErrInvalidTransition,
+			)
+	}
+
+	return *result.voteResponse, result.effects, nil
+}
+
+// SubmitAppendEntries processes an incoming AppendEntries RPC
+// through the serialized event loop. The response is returned
+// only after required Raft persistence has succeeded.
+func (rt *Runtime) SubmitAppendEntries(
+	ctx context.Context,
+	from string,
+	request AppendEntriesRequest,
+) (AppendEntriesResponse, error) {
+	result, err := rt.submit(ctx, Event{
+		Type:          EventAppendEntries,
+		From:          from,
+		AppendEntries: &request,
+	})
+	if err != nil {
+		return AppendEntriesResponse{}, err
+	}
+
+	if result.appendResponse == nil {
+		return AppendEntriesResponse{}, fmt.Errorf(
+			"%w: missing AppendEntries response",
+			ErrInvalidTransition,
+		)
+	}
+
+	return *result.appendResponse, nil
+}
+
+// run processes one Raft event at a time, queues its
+// effects in transition order, and returns the result.
 //
-// Until Task 27D-3 implements dispatching, accepted
-// events receive ErrUnsupportedEvent.
-//
-// During shutdown, remaining queued events are rejected.
+// A failure to enqueue effects disables further Raft
+// transitions because state may already be persisted.
 func (rt *Runtime) run() {
 	defer close(rt.done)
 
 	for {
-		// Prioritize shutdown before selecting another event.
+		// Check shutdown before beginning another event.
 		select {
 		case <-rt.stopCh:
 			rt.rejectPendingEvents()
@@ -200,8 +331,6 @@ func (rt *Runtime) run() {
 			return
 
 		case envelope := <-rt.events:
-			// Shutdown might have started after the
-			// event was selected.
 			select {
 			case <-rt.stopCh:
 				envelope.reply <- eventResult{
@@ -209,23 +338,147 @@ func (rt *Runtime) run() {
 				}
 				rt.rejectPendingEvents()
 				return
-
 			default:
 			}
 
-			// Placeholder until event handlers exist.
+			outcome, err := rt.raft.dispatchElectionEvent(
+				envelope.event,
+				rt.peers,
+			)
+			if err != nil {
+				envelope.reply <- eventResult{err: err}
+				continue
+			}
+
+			// Persistence has already been executed by
+			// processTransition(). Queue other effects
+			// before accepting the next transition.
+			if err := rt.effectQueue.Enqueue(outcome.Effects); err != nil {
+				rt.raft.mu.Lock()
+				rt.raft.failed = true
+				rt.raft.mu.Unlock()
+
+				envelope.reply <- eventResult{
+					err: fmt.Errorf(
+						"enqueue raft effects: %w",
+						err,
+					),
+				}
+				continue
+			}
+
+			// Apply timer changes immediately instead
+			// of waiting for the effect worker.
+			if outcome.Effects.ResetElectionTimer {
+				rt.resetElectionTimer()
+			}
+
+			// Effects are owned by the queue now.
 			envelope.reply <- eventResult{
-				err: ErrUnsupportedEvent,
+				voteResponse:   outcome.VoteResponse,
+				appendResponse: outcome.AppendResponse,
 			}
 		}
 	}
 }
 
-// rejectPendingEvents responds to every queued event
-// that has not begun processing.
+// resetElectionTimer requests a new randomized election
+// deadline without blocking the event-processing loop.
 //
-// Stop() prevents new admission before closing stopCh,
-// so no new events can enter while this queue is drained.
+// Multiple pending resets are coalesced into one.
+func (rt *Runtime) resetElectionTimer() {
+	select {
+	case rt.timerReset <- struct{}{}:
+	default:
+	}
+}
+
+// runElectionTimer triggers election-timeout events when
+// the node has not received a timer reset.
+//
+// Leaders skip election timeouts. Followers and
+// candidates may start or retry an election.
+func (rt *Runtime) runElectionTimer() {
+	defer close(rt.timerDone)
+
+	randomTimeout := func() time.Duration {
+		rangeSize := int64(maxElectionTimeout - minElectionTimeout)
+
+		return minElectionTimeout +
+			time.Duration(rand.Int64N(rangeSize))
+	}
+
+	timer := time.NewTimer(randomTimeout())
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-rt.stopCh:
+			return
+
+		case <-rt.timerReset:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(randomTimeout())
+
+		case <-timer.C:
+			// Only followers and candidates initiate
+			// elections after a timeout.
+			if rt.raft.Role() != Leader {
+				ctx, cancel := context.WithTimeout(
+					context.Background(),
+					time.Second,
+				)
+
+				_, err := rt.Submit(ctx, Event{
+					Type: EventElectionTimeout,
+				})
+
+				cancel()
+
+				if err != nil &&
+					!errors.Is(err, ErrRuntimeStopped) &&
+					!errors.Is(err, context.Canceled) {
+					// This minimal runtime retries on the
+					// next election timeout. Fatal failures
+					// remain recorded in the Raft engine.
+				}
+			}
+
+			timer.Reset(randomTimeout())
+		}
+	}
+}
+
+// runHeartbeatTicker schedules heartbeats while this node is leader.
+// Actual messages are constructed by dispatchElectionEvent and sent
+// asynchronously by the effect handler.
+func (rt *Runtime) runHeartbeatTicker() {
+	defer close(rt.heartbeatDone)
+	ticker := time.NewTicker(heartbeatInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-rt.stopCh:
+			return
+		case <-ticker.C:
+			if rt.raft.Role() != Leader {
+				continue
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), heartbeatInterval)
+			_, _ = rt.Submit(ctx, Event{Type: EventHeartbeatTimeout})
+			cancel()
+		}
+	}
+}
+
+// rejectPendingEvents replies with ErrRuntimeStopped
+// for every queued event that has not started processing.
 func (rt *Runtime) rejectPendingEvents() {
 	for {
 		select {
@@ -233,23 +486,17 @@ func (rt *Runtime) rejectPendingEvents() {
 			envelope.reply <- eventResult{
 				err: ErrRuntimeStopped,
 			}
-
 		default:
 			return
 		}
 	}
 }
 
-// Stop prevents new submissions and waits for the event
-// loop to exit.
+// Stop prevents new admissions, signals both workers,
+// and waits until they have exited.
 //
-// Stop is idempotent.
-//
-// If Stop is called before Start, the runtime transitions
-// directly to the stopped state and closes done.
-//
-// If called after Start, the worker finishes its current
-// operation and rejects pending events.
+// It is idempotent and supports stopping before Start.
+// It does not close the externally owned EffectQueue.
 func (rt *Runtime) Stop(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -263,6 +510,8 @@ func (rt *Runtime) Stop(ctx context.Context) error {
 
 		if !rt.started {
 			close(rt.done)
+			close(rt.timerDone)
+			close(rt.heartbeatDone)
 		}
 	}
 
@@ -270,8 +519,19 @@ func (rt *Runtime) Stop(ctx context.Context) error {
 
 	select {
 	case <-rt.done:
-		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 
+	select {
+	case <-rt.timerDone:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	select {
+	case <-rt.heartbeatDone:
+		return nil
 	case <-ctx.Done():
 		return ctx.Err()
 	}
